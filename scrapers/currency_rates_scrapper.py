@@ -1,10 +1,11 @@
-import sqlite3
+import os
 import requests
 import logging
 import random
 import time
-from datetime import datetime, timedelta
-from pathlib import Path
+from datetime import datetime, timedelta, date
+import psycopg2
+from dotenv import load_dotenv
 
 # Logger setup
 logging.basicConfig(
@@ -14,12 +15,31 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Relative Path Logic
-# Script location: /processors/nbu_live_scraper.py
-# .parent is /processors/
-# .parent.parent is /ua-aid-intelligence-hub/ (ROOT)
-ROOT_DIR = Path(__file__).resolve().parent.parent
-DB_PATH = ROOT_DIR / "data" / "master" / "master.db"
+# Environment Configuration
+load_dotenv()
+PG_URI = os.getenv("DATABASE_URL")
+
+if not PG_URI:
+    raise ValueError("DATABASE_URL not found in environment variables. Please check your .env file.")
+
+
+def init_db():
+    """
+    Ensures the target table exists in PostgreSQL with proper constraints.
+    """
+    conn = psycopg2.connect(PG_URI)
+    try:
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS exchange_rates (
+                date DATE PRIMARY KEY,
+                currency TEXT,
+                rate_uah REAL
+            )
+        ''')
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def get_latest_date():
@@ -27,63 +47,63 @@ def get_latest_date():
     Retrieves the maximum date from the exchange_rates table.
     Used for incremental loading.
     """
-    if not DB_PATH.exists():
-        logger.warning(f"Database not found at: {DB_PATH}")
-        return None
-
-    conn = sqlite3.connect(str(DB_PATH))
-    cursor = conn.cursor()
+    conn = None
     try:
-        # Verify if the table exists
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='exchange_rates'")
-        if not cursor.fetchone():
+        conn = psycopg2.connect(PG_URI)
+        cursor = conn.cursor()
+
+        # Check if the table exists first
+        cursor.execute("SELECT to_regclass('public.exchange_rates');")
+        if not cursor.fetchone()[0]:
             return None
 
         cursor.execute("SELECT MAX(date) FROM exchange_rates WHERE currency = 'EUR'")
         res = cursor.fetchone()[0]
-        return datetime.strptime(res, '%Y-%m-%d') if res else None
+
+        if not res:
+            return None
+
+        # Handle Postgres date/datetime returns
+        if isinstance(res, datetime):
+            return res
+        elif isinstance(res, date):
+            return datetime.combine(res, datetime.min.time())
+
+        return datetime.strptime(str(res).split(' ')[0], '%Y-%m-%d')
+
     except Exception as e:
         logger.error(f"Failed to check metadata: {e}")
         return None
     finally:
-        conn.close()
+        if conn:
+            conn.close()
 
 
 def sync_exchange_rates():
     """
-    Fetches missing EUR rates from NBU API and saves them to the master DB.
+    Fetches missing EUR rates from NBU API and saves them to the PostgreSQL DB.
     """
-    logger.info(f"Using Master DB at: {DB_PATH}")
+    logger.info("Initializing Database...")
+    init_db()
 
     last_date = get_latest_date()
     # If no data, start from the beginning of 2024
     start_date = (last_date + timedelta(days=1)) if last_date else datetime(2024, 1, 1)
     end_date = datetime.now()
 
-    if start_date > end_date:
+    # Compare only dates to avoid time-of-day execution bugs
+    if start_date.date() > end_date.date():
         logger.info("Exchange rates are already up to date.")
         return
 
-    # Ensure data/master/ exists
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = psycopg2.connect(PG_URI)
     cursor = conn.cursor()
-
-    # Primary Key on date ensures unique entries per day
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS exchange_rates (
-            date TEXT PRIMARY KEY,
-            currency TEXT,
-            rate_uah REAL
-        )
-    ''')
 
     current_date = start_date
     records_added = 0
 
     try:
-        while current_date <= end_date:
+        while current_date.date() <= end_date.date():
             date_api = current_date.strftime('%Y%m%d')
             url = f"https://bank.gov.ua/NBUStatService/v1/statdirectory/exchange?valcode=EUR&date={date_api}&json"
 
@@ -96,9 +116,12 @@ def sync_exchange_rates():
                     rate = data[0]['rate']
                     day_iso = current_date.strftime('%Y-%m-%d')
 
+                    # PostgreSQL equivalent for UPSERT
                     cursor.execute('''
-                        INSERT OR REPLACE INTO exchange_rates (date, currency, rate_uah)
-                        VALUES (?, ?, ?)
+                        INSERT INTO exchange_rates (date, currency, rate_uah)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (date) DO UPDATE 
+                        SET rate_uah = EXCLUDED.rate_uah
                     ''', (day_iso, 'EUR', rate))
 
                     logger.info(f"Fetched: {day_iso} | EUR: {rate}")
@@ -111,7 +134,7 @@ def sync_exchange_rates():
             time.sleep(random.uniform(0.1, 0.2))
 
         conn.commit()
-        logger.info(f"Synchronization complete. Records added: {records_added}")
+        logger.info(f"Synchronization complete. Records added/updated: {records_added}")
 
     except Exception as e:
         logger.error(f"Sync failed: {e}")

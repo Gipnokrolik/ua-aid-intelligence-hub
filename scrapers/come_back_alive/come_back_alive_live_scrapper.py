@@ -1,16 +1,24 @@
-import cloudscraper
-import sqlite3
+import os
 import time
 import math
 import random
-import datetime
 import logging
+import datetime
 from pathlib import Path
 
-# Path Configuration
-# H:/ua-aid-intelligence-hub/scrapers/come_back_alive/live_scraper.py -> Project Root
+import psycopg2
+import cloudscraper
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Configuration
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
-MASTER_DB_PATH = BASE_DIR / "data" / "master" / "master.db"
+PG_URI = os.getenv("DATABASE_URL")
+
+if not PG_URI:
+    raise ValueError("DATABASE_URL not found in environment variables")
 
 # Logging Setup
 logging.basicConfig(
@@ -27,26 +35,28 @@ FOUNDATION_NAME = 'come_back_alive'
 
 def get_latest_date_from_db():
     """
-    Finds the most recent date for CBA in the master database.
+    Retrieves the most recent donation date for the foundation.
     """
-    if not MASTER_DB_PATH.exists():
-        logging.error(f"Master DB not found at {MASTER_DB_PATH}")
-        return "2024-01-01"  # Safe fallback
-
-    conn = sqlite3.connect(MASTER_DB_PATH)
-    cursor = conn.cursor()
+    conn = None
     try:
-        # We look for the max date specifically for this foundation
-        cursor.execute("SELECT MAX(date) FROM donations WHERE foundation_name = ?", (FOUNDATION_NAME,))
+        conn = psycopg2.connect(PG_URI)
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT MAX(date) FROM donations WHERE foundation_name = %s", (FOUNDATION_NAME,))
         res = cursor.fetchone()[0]
-        return res if res else "2024-01-01"
+
+        return str(res)[:10] if res else "2024-01-01"
+    except Exception as e:
+        logging.error(f"Database error during date lookup: {e}")
+        return "2024-01-01"
     finally:
-        conn.close()
+        if conn:
+            conn.close()
 
 
 def normalize_date(date_str):
     """
-    Converts ISO 8601 (2025-01-01T00:09:48Z) to standard YYYY-MM-DD.
+    ISO 8601 string to YYYY-MM-DD.
     """
     try:
         return date_str.split('T')[0]
@@ -56,16 +66,13 @@ def normalize_date(date_str):
 
 def save_live_records(rows):
     """
-    Inserts records into the master database.
-    Uses INSERT OR IGNORE to prevent duplicates based on ID.
+    Batch inserts records with conflict handling.
     """
-    conn = sqlite3.connect(MASTER_DB_PATH)
+    conn = psycopg2.connect(PG_URI)
     cursor = conn.cursor()
 
-    # Prepare data for master schema: (id, amount, currency, date, comment, source, foundation_name, category)
-    prepared_rows = []
-    for r in rows:
-        prepared_rows.append((
+    prepared_rows = [
+        (
             r['id'],
             float(r['amount']),
             r['currency'],
@@ -73,18 +80,21 @@ def save_live_records(rows):
             r['comment'],
             r['source'],
             FOUNDATION_NAME,
-            'general'  # Default category for new live data
-        ))
+            'general'
+        ) for r in rows
+    ]
 
     try:
         cursor.executemany('''
-            INSERT OR IGNORE INTO donations (id, amount, currency, date, comment, source, foundation_name, category)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO donations (id, amount, currency, date, comment, source, foundation_name, category)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (id) DO NOTHING
         ''', prepared_rows)
         conn.commit()
         return cursor.rowcount
     except Exception as e:
-        logging.error(f"Failed to save to master DB: {e}")
+        logging.error(f"Insert failed: {e}")
+        conn.rollback()
         return 0
     finally:
         conn.close()
@@ -92,21 +102,18 @@ def save_live_records(rows):
 
 def run_live_update():
     """
-    Main loop to fetch and save missing data.
+    Main ingestion process.
     """
     last_date = get_latest_date_from_db()
-    # Add a small buffer (start 1 day earlier to ensure no gap)
     date_from = f"{last_date}T00:00:00.000Z"
     date_to = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
-    logging.info(f"Syncing {FOUNDATION_NAME}: from {date_from} to {date_to}")
+    logging.info(f"Syncing {FOUNDATION_NAME} from {date_from}")
 
     scraper = cloudscraper.create_scraper(
         browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True}
     )
 
-    current_page = 1
-    total_pages = 1
     params = {
         "date_from": date_from,
         "date_to": date_to,
@@ -114,44 +121,42 @@ def run_live_update():
         "page": 1
     }
 
-    # Initial request to get total pages
     try:
         response = scraper.get(API_URL, params=params)
-        if response.status_code == 200:
-            total_count = response.json().get('total_count', 0)
-            total_pages = math.ceil(total_count / RECORDS_PER_PAGE)
-            logging.info(f"Found {total_count} new potential records across {total_pages} pages")
-        else:
-            logging.error(f"API Error {response.status_code}")
+        if response.status_code != 200:
+            logging.error(f"API returned {response.status_code}")
             return
+
+        total_count = response.json().get('total_count', 0)
+        total_pages = math.ceil(total_count / RECORDS_PER_PAGE)
+        logging.info(f"Total potential records: {total_count} ({total_pages} pages)")
     except Exception as e:
-        logging.error(f"Connection failed: {e}")
+        logging.error(f"Initial request failed: {e}")
         return
 
-    # Crawling pages
-    while current_page <= total_pages:
+    for current_page in range(1, total_pages + 1):
         try:
             params["page"] = current_page
             res = scraper.get(API_URL, params=params)
 
             if res.status_code == 200:
                 rows = res.json().get('rows', [])
-                if not rows: break
+                if not rows:
+                    break
 
-                inserted = save_live_records(rows)
-                logging.info(f"Page {current_page}/{total_pages} | New records saved: {inserted}")
-
-                current_page += 1
+                count = save_live_records(rows)
+                logging.info(f"Page {current_page}/{total_pages} | Inserted: {count}")
                 time.sleep(random.uniform(0.3, 0.7))
             elif res.status_code == 429:
+                logging.warning("Rate limit hit. Waiting 60s.")
                 time.sleep(60)
             else:
                 break
         except Exception as e:
-            logging.error(f"Error during page fetch: {e}")
+            logging.error(f"Error on page {current_page}: {e}")
             break
 
-    logging.info("Live update completed.")
+    logging.info("Update complete.")
 
 
 if __name__ == "__main__":

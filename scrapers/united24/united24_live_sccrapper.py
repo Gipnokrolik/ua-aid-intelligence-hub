@@ -1,24 +1,29 @@
 import os
 import re
 import io
-import sqlite3
+import zlib
 import requests
 import pdfplumber
 import logging
-from datetime import datetime
+from datetime import datetime, date
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from webdriver_manager.chrome import ChromeDriverManager
 from bs4 import BeautifulSoup
 
-# Setup logging to track the process
+import psycopg2
+from dotenv import load_dotenv
+
+# Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Resolve relative paths based on the script location (scrapers/united24/)
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.normpath(os.path.join(SCRIPT_DIR, "..", ".."))
-DB_PATH = os.path.join(PROJECT_ROOT, "data", "master", "master.db")
+# Environment Configuration
+load_dotenv()
+PG_URI = os.getenv("DATABASE_URL")
+
+if not PG_URI:
+    raise ValueError("DATABASE_URL not found in environment variables")
 
 BASE_URL = "https://u24.gov.ua/reports"
 
@@ -26,27 +31,32 @@ BASE_URL = "https://u24.gov.ua/reports"
 def get_latest_u24_date():
     """
     Retrieves the maximum date specifically for United24 records in the DB.
-    Ensures that dates from other foundations do not interfere.
     """
-    if not os.path.exists(DB_PATH):
-        logging.warning(f"Database file not found at: {DB_PATH}")
-        return datetime.min
-
+    conn = None
     try:
-        with sqlite3.connect(DB_PATH) as conn:
-            cursor = conn.cursor()
-            # Filter strictly by foundation_name to get the correct delta point
-            cursor.execute("SELECT MAX(date) FROM donations WHERE foundation_name = 'united24'")
-            res = cursor.fetchone()[0]
-            if not res:
-                return datetime.min
+        conn = psycopg2.connect(PG_URI)
+        cursor = conn.cursor()
+        cursor.execute("SELECT MAX(date) FROM donations WHERE foundation_name = 'united24'")
+        res = cursor.fetchone()[0]
 
-            # Handle standard ISO format (YYYY-MM-DD) or legacy formats
-            date_fmt = '%Y-%m-%d' if '-' in res else '%d.%m.%Y'
-            return datetime.strptime(res, date_fmt)
+        if not res:
+            return datetime.min
+
+        # Postgres returns datetime/date objects automatically
+        if isinstance(res, datetime):
+            return res
+        elif isinstance(res, date):
+            return datetime.combine(res, datetime.min.time())
+
+        # Fallback for string
+        date_fmt = '%Y-%m-%d' if '-' in str(res) else '%d.%m.%Y'
+        return datetime.strptime(str(res), date_fmt)
     except Exception as e:
         logging.error(f"Database check failed: {e}")
         return datetime.min
+    finally:
+        if conn:
+            conn.close()
 
 
 def get_report_links():
@@ -64,7 +74,7 @@ def get_report_links():
     try:
         driver.get(BASE_URL)
         import time
-        time.sleep(5)  # Wait for JS to render the list
+        time.sleep(5)
 
         soup = BeautifulSoup(driver.page_source, 'html.parser')
         anchors = soup.find_all('a', href=True)
@@ -72,7 +82,6 @@ def get_report_links():
         pdf_links = []
         for a in anchors:
             href = a['href']
-            # Target only report-specific PDF files
             if '.pdf' in href.lower() and 'report' in href.lower():
                 full_url = href if href.startswith('http') else f"https://u24.gov.ua{href}"
                 pdf_links.append(full_url)
@@ -96,8 +105,6 @@ def run_smart_sync():
 
     for url in links:
         filename = os.path.basename(url).split('?')[0]
-
-        # Parse date from filename (expected format: report-YYYYMMDD-category.pdf)
         date_match = re.search(r'(\d{8})', filename)
         if not date_match:
             continue
@@ -105,17 +112,14 @@ def run_smart_sync():
         file_date = datetime.strptime(date_match.group(1), '%Y%m%d')
         category = os.path.splitext(filename.split('-')[-1])[0].lower()
 
-        # Check if the report is worth downloading based on the date delta
         if file_date >= last_db_date:
             logging.info(f"Processing report: {filename}")
             try:
-                # Download file to memory stream
                 response = requests.get(url, timeout=30)
                 response.raise_for_status()
 
                 parsed_rows = []
                 with pdfplumber.open(io.BytesIO(response.content)) as pdf:
-                    # Receipts are typically located on pages 1-21
                     for page in pdf.pages[:21]:
                         table = page.extract_table()
                         if not table:
@@ -123,11 +127,9 @@ def run_smart_sync():
 
                         for row in table:
                             try:
-                                # Validate row by checking for a date pattern in the first column
                                 if not re.match(r'^\d{2}\.\d{2}\.\d{4}$', row[0]):
                                     continue
 
-                                # Clean numeric strings: "25 261,00" -> 25261.0
                                 amount = float(row[1].replace(' ', '').replace(',', '.'))
                                 date_str = datetime.strptime(row[0], '%d.%m.%Y').strftime('%Y-%m-%d')
 
@@ -140,31 +142,51 @@ def run_smart_sync():
                                 continue
 
                 if parsed_rows:
-                    with sqlite3.connect(DB_PATH) as conn:
+                    conn = psycopg2.connect(PG_URI)
+                    try:
                         cursor = conn.cursor()
-                        # Load existing dates for this category to ensure zero duplicates
                         cursor.execute(
-                            "SELECT date FROM donations WHERE foundation_name='united24' AND category=?",
+                            "SELECT date FROM donations WHERE foundation_name='united24' AND category=%s",
                             (category,)
                         )
-                        known_dates = {r[0] for r in cursor.fetchall()}
 
-                        to_insert = [
-                            (r['date'], r['amount'], 'UAH', 'united24', r['category'])
-                            for r in parsed_rows if r['date'] not in known_dates
-                        ]
+                        # Normalize DB dates to YYYY-MM-DD string for safe comparison
+                        known_dates = set()
+                        for db_row in cursor.fetchall():
+                            d = db_row[0]
+                            if isinstance(d, (datetime, date)):
+                                known_dates.add(d.strftime('%Y-%m-%d'))
+                            else:
+                                known_dates.add(str(d).split(' ')[0])
+
+                        to_insert = []
+                        for r in parsed_rows:
+                            if r['date'] not in known_dates:
+                                # Generate deterministic ID to satisfy Postgres PRIMARY KEY
+                                unique_str = f"u24_{r['date']}_{r['amount']}_{r['category']}"
+                                record_id = zlib.crc32(unique_str.encode('utf-8'))
+
+                                to_insert.append((
+                                    record_id, r['date'], r['amount'], 'UAH', 'united24', r['category']
+                                ))
 
                         if to_insert:
-                            # Mapping based on master.db schema: date, amount, currency, foundation_name, category
-                            query = "INSERT INTO donations (date, amount, currency, foundation_name, category) VALUES (?, ?, ?, ?, ?)"
+                            # Added ON CONFLICT DO NOTHING to match Enterprise architecture
+                            query = """
+                                INSERT INTO donations (id, date, amount, currency, foundation_name, category) 
+                                VALUES (%s, %s, %s, %s, %s, %s)
+                                ON CONFLICT (id) DO NOTHING
+                            """
                             cursor.executemany(query, to_insert)
                             conn.commit()
                             records_added += len(to_insert)
+                    finally:
+                        conn.close()
 
             except Exception as e:
                 logging.error(f"Error processing {filename}: {e}")
 
-    logging.info(f"Sync finalized. {records_added} new entries pushed to master.db.")
+    logging.info(f"Sync finalized. {records_added} new entries pushed to master database.")
 
 
 if __name__ == "__main__":
