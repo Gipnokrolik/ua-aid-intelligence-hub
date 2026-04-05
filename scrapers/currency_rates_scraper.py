@@ -16,6 +16,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Environment Configuration
+# Technical Note: Ensure .env is accessible via absolute path in WSL/Airflow context
 load_dotenv()
 PG_URI = os.getenv("DATABASE_URL")
 
@@ -94,6 +95,8 @@ def sync_exchange_rates():
     # Compare only dates to avoid time-of-day execution bugs
     if start_date.date() > end_date.date():
         logger.info("Exchange rates are already up to date.")
+        # Technical Note: Print 0 as the last stdout line for Airflow XCom telemetry
+        print(0)
         return
 
     conn = psycopg2.connect(PG_URI)
@@ -141,6 +144,9 @@ def sync_exchange_rates():
         conn.rollback()
     finally:
         conn.close()
+
+    # Technical Note: Final stdout output consumed by the downstream alerting bot
+    print(records_added)
 
 
 if __name__ == "__main__":

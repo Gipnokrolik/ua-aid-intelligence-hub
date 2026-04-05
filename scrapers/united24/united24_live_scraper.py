@@ -42,13 +42,11 @@ def get_latest_u24_date():
         if not res:
             return datetime.min
 
-        # Postgres returns datetime/date objects automatically
         if isinstance(res, datetime):
             return res
         elif isinstance(res, date):
             return datetime.combine(res, datetime.min.time())
 
-        # Fallback for string
         date_fmt = '%Y-%m-%d' if '-' in str(res) else '%d.%m.%Y'
         return datetime.strptime(str(res), date_fmt)
     except Exception as e:
@@ -150,7 +148,6 @@ def run_smart_sync():
                             (category,)
                         )
 
-                        # Normalize DB dates to YYYY-MM-DD string for safe comparison
                         known_dates = set()
                         for db_row in cursor.fetchall():
                             d = db_row[0]
@@ -162,7 +159,6 @@ def run_smart_sync():
                         to_insert = []
                         for r in parsed_rows:
                             if r['date'] not in known_dates:
-                                # Generate deterministic ID to satisfy Postgres PRIMARY KEY
                                 unique_str = f"u24_{r['date']}_{r['amount']}_{r['category']}"
                                 record_id = zlib.crc32(unique_str.encode('utf-8'))
 
@@ -171,7 +167,6 @@ def run_smart_sync():
                                 ))
 
                         if to_insert:
-                            # Added ON CONFLICT DO NOTHING to match Enterprise architecture
                             query = """
                                 INSERT INTO donations (id, date, amount, currency, foundation_name, category) 
                                 VALUES (%s, %s, %s, %s, %s, %s)
@@ -187,6 +182,9 @@ def run_smart_sync():
                 logging.error(f"Error processing {filename}: {e}")
 
     logging.info(f"Sync finalized. {records_added} new entries pushed to master database.")
+
+    # Technical Note: Final stdout line for Airflow XCom telemetry consumption
+    print(records_added)
 
 
 if __name__ == "__main__":

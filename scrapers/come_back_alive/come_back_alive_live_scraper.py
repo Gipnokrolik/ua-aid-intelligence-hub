@@ -67,6 +67,7 @@ def normalize_date(date_str):
 def save_live_records(rows):
     """
     Batch inserts records with conflict handling.
+    Returns the number of rows actually inserted.
     """
     conn = psycopg2.connect(PG_URI)
     cursor = conn.cursor()
@@ -91,6 +92,7 @@ def save_live_records(rows):
             ON CONFLICT (id) DO NOTHING
         ''', prepared_rows)
         conn.commit()
+        # rowcount represents number of affected rows
         return cursor.rowcount
     except Exception as e:
         logging.error(f"Insert failed: {e}")
@@ -121,10 +123,14 @@ def run_live_update():
         "page": 1
     }
 
+    # Technical Note: Initialize counter for Airflow XCom telemetry
+    total_records_added = 0
+
     try:
         response = scraper.get(API_URL, params=params)
         if response.status_code != 200:
             logging.error(f"API returned {response.status_code}")
+            print(0)
             return
 
         total_count = response.json().get('total_count', 0)
@@ -132,6 +138,7 @@ def run_live_update():
         logging.info(f"Total potential records: {total_count} ({total_pages} pages)")
     except Exception as e:
         logging.error(f"Initial request failed: {e}")
+        print(0)
         return
 
     for current_page in range(1, total_pages + 1):
@@ -145,6 +152,7 @@ def run_live_update():
                     break
 
                 count = save_live_records(rows)
+                total_records_added += count
                 logging.info(f"Page {current_page}/{total_pages} | Inserted: {count}")
                 time.sleep(random.uniform(0.3, 0.7))
             elif res.status_code == 429:
@@ -156,7 +164,10 @@ def run_live_update():
             logging.error(f"Error on page {current_page}: {e}")
             break
 
-    logging.info("Update complete.")
+    logging.info(f"Update complete. Total new entries: {total_records_added}")
+
+    # Technical Note: Final stdout line to be consumed by the alerting system
+    print(total_records_added)
 
 
 if __name__ == "__main__":
