@@ -24,7 +24,7 @@ default_args = {
 with DAG(
     'ua_aid_daily_extraction',
     default_args=default_args,
-    schedule_interval='@daily',
+    schedule_interval='30 6 * * *',
     catchup=False,
     tags=['production', 'osint']
 ) as dag:
