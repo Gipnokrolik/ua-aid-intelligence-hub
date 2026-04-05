@@ -221,3 +221,5 @@ superset_config.py
 # GCP Credentials
 keys/
 *.json
+
+.idea/
