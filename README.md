@@ -2,7 +2,7 @@ UA Aid Intelligence Hub
 
 UA Aid Intelligence Hub is an open-source, high-performance ETL ecosystem designed to aggregate, clean, and analyze the transparency of aid flows to Ukraine. By correlating millions of donation records with global news trends and financial data, it transforms raw fragments into structured intelligence.
 
-🚀 Key Features
+Key Features
 Autonomous Orchestration: Managed by Apache Airflow, ensuring 24/7 reliability with scheduled DAGs and automated retry logic.
 
 Massive Data Processing: Engineered to handle 2,000,000+ transaction records with strict deduplication and integrity checks.
@@ -15,12 +15,12 @@ Multi-Fund Aggregation: High-resilience scrapers for United24, Come Back Alive, 
 
 Financial Accuracy: Real-time NBU (National Bank of Ukraine) exchange rate synchronization for precise multi-currency analytics.
 
-🛠 Tech Stack
+Tech Stack
 The project is built on a high-performance, production-ready stack:
 
 Orchestration: Apache Airflow 2.x (DAGs, XCom, Callbacks)
 
-Language: Python 3.11+ (Psycopg2, Cloudscraper, SQLAlchemy, Pandas, Selenium)
+Language: Python (Psycopg2, Cloudscraper, SQLAlchemy, Pandas, Selenium, ScyPy etc)
 
 Database: PostgreSQL (Optimized for large-scale relational data)
 
@@ -32,7 +32,7 @@ Environment: Ubuntu Server / WSL2 (High-performance Linux kernel)
 
 Visualization: Apache Superset (Enterprise-grade BI)
 
-🏗 System Architecture
+System Architecture
 Orchestration Layer: Airflow triggers daily extraction cycles, managing dependencies between financial, news, and donation tasks.
 
 Extraction: Custom scrapers (PDF, API, and Headless Chrome) bypass protections to gather raw data from distributed sources.
@@ -45,5 +45,5 @@ Telemetry: Upon task completion, metadata (row counts, execution time) is aggreg
 
 Analytics: Apache Superset queries the master DB to generate real-time, data-driven insights and interactive dashboards.
 
-📦 Deployment
+Deployment
 The hub utilizes a decoupled architecture where scrapers run in isolated virtual environments managed by the Airflow scheduler, ensuring maximum stability and dependency control.
