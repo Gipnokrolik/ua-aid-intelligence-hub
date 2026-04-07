@@ -1,5 +1,7 @@
 import os
+import sys
 import time
+import json
 import logging
 import pandas as pd
 from bs4 import BeautifulSoup
@@ -9,8 +11,12 @@ from google.cloud import bigquery
 from dotenv import load_dotenv
 from pathlib import Path
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+# Configure logging to output to stderr to prevent interference with Airflow XCom stdout captures
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    stream=sys.stderr
+)
 logger = logging.getLogger(__name__)
 
 # Environment setup
@@ -22,21 +28,23 @@ load_dotenv(dotenv_path=ENV_PATH)
 bq_key_path = BASE_DIR / 'keys' / 'bq_key.json'
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(bq_key_path)
 
-PG_URI = os.getenv("DATABASE_URL")
 
-if not PG_URI:
-    raise ValueError(f"DATABASE_URL not found at: {ENV_PATH}")
+def get_db_engine():
+    """Initialize and return the SQLAlchemy engine."""
+    pg_uri = os.getenv("DATABASE_URL")
+    if not pg_uri:
+        raise ValueError(f"DATABASE_URL not found at: {ENV_PATH}")
 
-if PG_URI.startswith("postgres://"):
-    PG_URI = PG_URI.replace("postgres://", "postgresql://", 1)
+    if pg_uri.startswith("postgres://"):
+        pg_uri = pg_uri.replace("postgres://", "postgresql://", 1)
 
-ENGINE = create_engine(PG_URI)
+    return create_engine(pg_uri)
 
 
-def get_latest_news_date():
+def get_latest_news_date(engine):
     """Fetch the latest date from the Postgres database."""
     try:
-        with ENGINE.connect() as conn:
+        with engine.connect() as conn:
             result = conn.execute(text("SELECT to_regclass('public.news');")).scalar()
             if not result:
                 return "2025-01-01"
@@ -49,7 +57,7 @@ def get_latest_news_date():
 
 
 def fetch_article_headline(url, scraper):
-    """Scrape headline using cloudscraper."""
+    """Scrape headline using cloudscraper. Returns None on failure."""
     try:
         response = scraper.get(url, timeout=15)
         response.raise_for_status()
@@ -66,13 +74,15 @@ def fetch_article_headline(url, scraper):
         if soup.title:
             return soup.title.get_text(strip=True)
 
-        return "Headline not found"
+        return None
     except Exception as e:
-        return f"Request Error: {e}"
+        logger.error(f"Request failed for {url}: {e}")
+        return None
 
 
 def run_automated_pipeline():
-    last_date = get_latest_news_date()
+    engine = get_db_engine()
+    last_date = get_latest_news_date(engine)
     logger.info(f"Latest news date: {last_date}. Fetching from BigQuery...")
 
     try:
@@ -81,16 +91,22 @@ def run_automated_pipeline():
         logger.error("BigQuery auth failed.")
         raise e
 
-    # Query BigQuery
-    query = f"""
+    # Query BigQuery using parameters for safety against SQL injection
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("last_date", "STRING", last_date),
+        ]
+    )
+
+    query = """
     SELECT
       FORMAT_TIMESTAMP('%Y-%m-%d', PARSE_TIMESTAMP('%Y%m%d%H%M%S', CAST(date AS STRING))) AS event_date,
       LOWER(SourceCommonName) AS source,
       DocumentIdentifier AS url
     FROM `gdelt-bq.gdeltv2.gkg_partitioned`
     WHERE
-      _PARTITIONTIME >= TIMESTAMP("{last_date}")
-      AND FORMAT_TIMESTAMP('%Y-%m-%d', PARSE_TIMESTAMP('%Y%m%d%H%M%S', CAST(date AS STRING))) > "{last_date}"
+      _PARTITIONTIME >= TIMESTAMP(@last_date)
+      AND FORMAT_TIMESTAMP('%Y-%m-%d', PARSE_TIMESTAMP('%Y%m%d%H%M%S', CAST(date AS STRING))) > @last_date
       AND (V2Themes LIKE '%UKRAINE%' OR V2Themes LIKE '%UKR%')
       AND (V2Themes LIKE '%WAR%' OR V2Themes LIKE '%CONFLICT%' OR V2Themes LIKE '%MILITARY%')
       AND LOWER(SourceCommonName) IN ('theguardian.com', 'kyivindependent.com')
@@ -99,11 +115,11 @@ def run_automated_pipeline():
     """
 
     logger.info("Executing query...")
-    df = bq_client.query(query).to_dataframe()
+    df = bq_client.query(query, job_config=job_config).to_dataframe()
 
     if df.empty:
         logger.info("No new articles found. Exiting.")
-        print(0)
+        print(0, flush=True)
         return
 
     # Drop duplicate URLs
@@ -125,33 +141,42 @@ def run_automated_pipeline():
 
     news['headers'] = headlines
 
-    # Error cleanup
+    # Error cleanup: Drop rows where headline is None
     initial_count = len(news)
-    news = news[~news['headers'].str.contains('Error', na=False)]
-    logger.info(f"Removed {initial_count - len(news)} rows due to errors.")
+    news = news.dropna(subset=['headers'])
+    logger.info(f"Removed {initial_count - len(news)} rows due to request errors or missing headers.")
 
     if news.empty:
         logger.warning("No valid headlines. Exiting.")
-        print(0)
+        print(0, flush=True)
         return
 
     # Data aggregation
     logger.info("Aggregating data...")
     news_final = news.groupby(['event_date', 'source'], as_index=False).agg({'headers': list})
     news_export = news_final.rename(columns={'event_date': 'date'})
-    news_export['headers'] = news_export['headers'].astype(str)
+
+    # Serialize lists to valid JSON strings for PostgreSQL compatibility
+    news_export['headers'] = news_export['headers'].apply(json.dumps)
 
     # Database export
-    logger.info("Pushing to PostgreSQL...")
+    logger.info("Pushing to PostgreSQL via direct SQLAlchemy execution...")
     try:
-        with ENGINE.begin() as conn:
-            news_export.to_sql('news', conn, if_exists='append', index=False)
+        with engine.begin() as conn:
+            # Convert DataFrame to a list of dictionaries for bulk insert
+            records = news_export.to_dict(orient='records')
+
+            if records:
+                insert_stmt = text(
+                    "INSERT INTO news (date, source, headers) VALUES (:date, :source, :headers)"
+                )
+                conn.execute(insert_stmt, records)
 
         rows_added = len(news_export)
         logger.info(f"SUCCESS: {rows_added} rows added.")
 
-        # Print value for Airflow XCom
-        print(rows_added)
+        # Print value for Airflow XCom with forced flush
+        print(rows_added, flush=True)
 
     except Exception as e:
         logger.error(f"Database export failed: {e}")

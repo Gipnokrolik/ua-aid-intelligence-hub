@@ -11,7 +11,8 @@ if PROJECT_DIR not in sys.path:
 
 from alert_telegram_bot.telegram_report import send_report_task_logic
 
-PYTHON_EXEC = '/home/drkosher/airflow_project/venv/bin/python'
+# Added -u flag for unbuffered stdout/stderr to ensure immediate log capture
+PYTHON_EXEC = '/home/drkosher/airflow_project/venv/bin/python -u'
 
 default_args = {
     'owner': 'kosher',
