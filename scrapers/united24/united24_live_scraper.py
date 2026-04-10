@@ -13,6 +13,7 @@ from webdriver_manager.chrome import ChromeDriverManager
 from bs4 import BeautifulSoup
 
 import psycopg2
+from psycopg2.extras import execute_values  # Added for bulk insert with return values
 from dotenv import load_dotenv
 
 # Setup logging
@@ -167,14 +168,20 @@ def run_smart_sync():
                                 ))
 
                         if to_insert:
+                            # Using execute_values with RETURNING clause ensures we only count
+                            # rows that bypassed the ON CONFLICT constraint and were physically inserted.
                             query = """
                                 INSERT INTO donations (id, date, amount, currency, foundation_name, category) 
-                                VALUES (%s, %s, %s, %s, %s, %s)
+                                VALUES %s
                                 ON CONFLICT (id) DO NOTHING
+                                RETURNING id
                             """
-                            cursor.executemany(query, to_insert)
+                            # fetch=True returns the data specified in RETURNING
+                            inserted_rows = execute_values(cursor, query, to_insert, fetch=True)
                             conn.commit()
-                            records_added += len(to_insert)
+
+                            if inserted_rows:
+                                records_added += len(inserted_rows)
                     finally:
                         conn.close()
 

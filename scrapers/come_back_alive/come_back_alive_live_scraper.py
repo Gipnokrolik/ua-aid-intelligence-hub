@@ -1,4 +1,5 @@
 import os
+import sys  # Added for proper exit codes
 import time
 import math
 import random
@@ -130,16 +131,14 @@ def run_live_update():
         response = scraper.get(API_URL, params=params)
         if response.status_code != 200:
             logging.error(f"API returned {response.status_code}")
-            print(0)
-            return
+            sys.exit(1)  # Fix: Hard exit on API error
 
         total_count = response.json().get('total_count', 0)
         total_pages = math.ceil(total_count / RECORDS_PER_PAGE)
         logging.info(f"Total potential records: {total_count} ({total_pages} pages)")
     except Exception as e:
         logging.error(f"Initial request failed: {e}")
-        print(0)
-        return
+        sys.exit(1)  # Fix: Hard exit on connection failure
 
     for current_page in range(1, total_pages + 1):
         try:
@@ -159,10 +158,11 @@ def run_live_update():
                 logging.warning("Rate limit hit. Waiting 60s.")
                 time.sleep(60)
             else:
-                break
+                logging.error(f"API returned {res.status_code} on page {current_page}")
+                sys.exit(1)  # Fix: Hard exit on pagination API error
         except Exception as e:
             logging.error(f"Error on page {current_page}: {e}")
-            break
+            sys.exit(1)  # Fix: Hard exit on exception during pagination
 
     logging.info(f"Update complete. Total new entries: {total_records_added}")
 

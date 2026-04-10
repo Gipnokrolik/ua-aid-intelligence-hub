@@ -18,8 +18,8 @@ default_args = {
     'owner': 'kosher',
     'depends_on_past': False,
     'start_date': datetime(2026, 4, 1),
-    'retries': 1,
-    'retry_delay': timedelta(minutes=5),
+    'retries': 2,
+    'retry_delay': timedelta(minutes=3),
 }
 
 with DAG(
